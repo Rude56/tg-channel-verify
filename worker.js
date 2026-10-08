@@ -21,6 +21,19 @@ function getWindowSeconds(env) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_WINDOW_SECONDS;
 }
 
+// 把 message id 追加进一个逗号分隔的字符串(最多留 1000 个,避免无限增长)
+function appendMessageId(csv, id) {
+  const list = String(csv || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const v = String(id || "").trim();
+  if (!v || list.includes(v)) return list.join(",");
+  list.push(v);
+  return list.slice(-1000).join(",");
+}
+
+function splitMessageIds(csv) {
+  return String(csv || "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -110,7 +123,7 @@ async function ensureSchema(env) {
          pending_at INTEGER,
          created_at INTEGER NOT NULL,
          challenge_message_id TEXT,
-         first_message_id     TEXT
+         seen_message_ids     TEXT
        )`
     ),
     env.DB.prepare(
@@ -178,20 +191,9 @@ async function handleMyChatMember(update, env) {
   }
 }
 
-async function failAndBan(env, { userId, channelId, chatId, topicId, messageIds }) {
-  let removed = false;
-
-  if (topicId && chatId) {
-    const res = await telegram(env, "deleteForumTopic", {
-      chat_id: chatId,
-      message_thread_id: Number(topicId),
-    });
-    removed = res?.ok === true;
-  }
-
-  if (!removed) await deleteMessages(env, chatId, messageIds || []);
+async function failAndBan(env, { userId, channelId, chatId, messageIds }) {
+  await deleteMessages(env, chatId, messageIds || []);
   if (channelId) await banUser(env, channelId, userId);
-
   await env.DB.prepare("DELETE FROM verified_users WHERE user_id = ?").bind(userId).run();
 }
 
@@ -217,7 +219,7 @@ async function handleUpdate(update, env) {
     (async () => {
       await ensureSchema(env);
       return env.DB.prepare(
-        "SELECT status, pending_at, challenge_message_id, first_message_id FROM verified_users WHERE user_id = ?"
+        "SELECT status, pending_at, challenge_message_id, seen_message_ids FROM verified_users WHERE user_id = ?"
       )
         .bind(userId)
         .first();
@@ -229,16 +231,17 @@ async function handleUpdate(update, env) {
   if (wl.mode === "list" && (!channelId || !wl.ids.includes(channelId))) return;
 
   const text = typeof message.text === "string" ? message.text.trim() : "";
+  const passPhrase = getPassPhrase(env);
+  const windowSec = getWindowSeconds(env);
   const ts = nowSec();
 
   if (row?.status === "verified") return;
 
   if (row?.status === "pending") {
-    const windowSec = getWindowSeconds(env);
     const expired = row.pending_at != null && ts - row.pending_at > windowSec;
     const hasOwnText = text.length > 0 && !isForwarded(message);
 
-    if (hasOwnText && text === getPassPhrase(env) && !expired) {
+    if (hasOwnText && text === passPhrase && !expired) {
       const reacted = await reactToMessage(env, chatId, messageId);
       if (!reacted) console.log(`[react] 点表情失败 messageId=${messageId}`);
 
@@ -246,12 +249,20 @@ async function handleUpdate(update, env) {
       await env.DB.prepare(
         `UPDATE verified_users
             SET status = 'verified', pending_at = NULL,
-                challenge_message_id = NULL, first_message_id = NULL
+                challenge_message_id = NULL, seen_message_ids = NULL
           WHERE user_id = ?`
       )
         .bind(userId)
         .run();
       return;
+    }
+
+    // 把这条消息记下来,验证失败时一并删除
+    const seen = appendMessageId(row.seen_message_ids, messageId);
+    if (seen !== String(row.seen_message_ids || "")) {
+      await env.DB.prepare("UPDATE verified_users SET seen_message_ids = ? WHERE user_id = ?")
+        .bind(seen, userId)
+        .run();
     }
 
     if (!expired) return;
@@ -260,19 +271,16 @@ async function handleUpdate(update, env) {
       userId,
       channelId,
       chatId,
-      topicId,
-      messageIds: [row.first_message_id, row.challenge_message_id, messageId],
+      messageIds: [row.challenge_message_id, ...splitMessageIds(seen)],
     });
     return;
   }
 
-  const windowSec = getWindowSeconds(env);
-  const passPhrase = getPassPhrase(env);
   const sent = await sendToTopic(
     env,
     chatId,
     topicId,
-    `⭕正在进行人机验证，请在 ${humanizeSeconds(windowSec)}内,把下面这句话原样发给我，否则将会被永久封禁:\n` +
+    `⭕正在进行人机验证，请在 ${humanizeSeconds(windowSec)}内,把下面这句话原样发给我，否则将会被永久封禁:\n\n` +
       `<code>${escapeHtml(passPhrase)}</code>`,
     {
       parse_mode: "HTML",
@@ -288,7 +296,7 @@ async function handleUpdate(update, env) {
   await env.DB.prepare(
     `INSERT OR REPLACE INTO verified_users
        (user_id, topic_id, chat_id, channel_id, status, pending_at, created_at,
-        challenge_message_id, first_message_id)
+        challenge_message_id, seen_message_ids)
      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`
   )
     .bind(
@@ -311,7 +319,7 @@ async function sweepExpired(env) {
 
   const cutoff = nowSec() - getWindowSeconds(env);
   const rows = await env.DB.prepare(
-    `SELECT user_id, channel_id, chat_id, topic_id, challenge_message_id, first_message_id
+    `SELECT user_id, channel_id, chat_id, challenge_message_id, seen_message_ids
        FROM verified_users
       WHERE status = 'pending' AND pending_at IS NOT NULL AND pending_at <= ?
       LIMIT ${SWEEP_LIMIT}`
@@ -324,8 +332,7 @@ async function sweepExpired(env) {
       userId: String(r.user_id),
       channelId: String(r.channel_id || ""),
       chatId: String(r.chat_id || ""),
-      topicId: String(r.topic_id || ""),
-      messageIds: [r.first_message_id, r.challenge_message_id],
+      messageIds: [r.challenge_message_id, ...splitMessageIds(r.seen_message_ids)],
     });
   }
 }
