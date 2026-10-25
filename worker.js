@@ -1,16 +1,51 @@
 /**
  * Telegram 频道私信人机验证 Bot
  * Cloudflare Workers + D1 + Cron
+ *
+ * v1.1.0
  */
 
+const VERSION = "1.1.0";
 const TG_API = "https://api.telegram.org";
 const DEFAULT_PASS_PHRASE = "我是真人，我不打广告";
 const DEFAULT_WINDOW_SECONDS = 600;
 const REACTION = "💯";
-const SWEEP_LIMIT = 6;
+const SWEEP_LIMIT = 10;
+// 免费版 Workers 单次调用子请求上限为 50，留出余量给 DB 与其它调用
+const MAX_API_CALLS_PER_RUN = 40;
+// 频道私信会话 -> 频道 ID 的缓存上限
+const DM_CACHE_LIMIT = 500;
 
 const ok = () => new Response("ok");
 const nowSec = () => Math.floor(Date.now() / 1000);
+
+function versionResponse(request) {
+  const accept = request?.headers?.get?.("accept") || "";
+  if (accept.includes("application/json")) {
+    return new Response(
+      JSON.stringify({ name: "tg-channel-verify", version: VERSION }),
+      { headers: { "content-type": "application/json; charset=utf-8" } }
+    );
+  }
+  return new Response(`tg-channel-verify v${VERSION}\n`, {
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+// 单次调用内可用的 Telegram 子请求配额
+function makeBudget(limit = MAX_API_CALLS_PER_RUN) {
+  let left = limit;
+  return {
+    get left() {
+      return left;
+    },
+    take() {
+      if (left <= 0) return false;
+      left -= 1;
+      return true;
+    },
+  };
+}
 
 function getPassPhrase(env) {
   return String(env.PASS_PHRASE ?? "").trim() || DEFAULT_PASS_PHRASE;
@@ -80,14 +115,6 @@ function sendToTopic(env, chatId, topicId, text, extra = {}) {
   });
 }
 
-function banUser(env, channelId, userId) {
-  return telegram(env, "banChatMember", {
-    chat_id: channelId,
-    user_id: Number(userId),
-    revoke_messages: true,
-  });
-}
-
 async function reactToMessage(env, chatId, messageId) {
   const res = await telegram(env, "setMessageReaction", {
     chat_id: chatId,
@@ -97,13 +124,20 @@ async function reactToMessage(env, chatId, messageId) {
   return res?.ok === true;
 }
 
-async function deleteMessages(env, chatId, ids) {
+// 逐条删除,但受配额约束。返回没删完的 id 列表(交给下一轮 cron 继续)
+async function deleteMessages(env, chatId, ids, budget) {
   const list = [
     ...new Set((ids || []).map((x) => (x == null ? "" : String(x).trim())).filter(Boolean)),
   ];
-  for (const id of list) {
-    await telegram(env, "deleteMessage", { chat_id: chatId, message_id: Number(id) });
+  const remaining = [];
+  for (let i = 0; i < list.length; i++) {
+    if (!budget.take()) {
+      remaining.push(...list.slice(i));
+      break;
+    }
+    await telegram(env, "deleteMessage", { chat_id: chatId, message_id: Number(list[i]) });
   }
+  return remaining;
 }
 
 let schemaReady = false;
@@ -133,7 +167,23 @@ async function ensureSchema(env) {
 
   schemaReady = true;
 }
+
+// 表被外部 DROP 后 isolate 里的 schemaReady 会失效,这里做一次自愈
+function handleDbError(err) {
+  const msg = String(err?.message || err || "");
+  if (/no such table/i.test(msg)) schemaReady = false;
+  return msg;
+}
+
 const dmChatChannelCache = new Map();
+
+function cacheSet(map, key, value) {
+  if (map.size >= DM_CACHE_LIMIT) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
 
 // 私信消息里的 chat 是「频道私信会话」,对它的 id 调 getChat 才能拿到真正的频道 id
 async function resolveChannelId(message, env) {
@@ -154,7 +204,7 @@ async function resolveChannelId(message, env) {
   }
 
   const value = String(channelId);
-  dmChatChannelCache.set(dmChatId, value);
+  cacheSet(dmChatChannelCache, dmChatId, value);
   return value;
 }
 
@@ -191,10 +241,42 @@ async function handleMyChatMember(update, env) {
   }
 }
 
-async function failAndBan(env, { userId, channelId, chatId, messageIds }) {
-  await deleteMessages(env, chatId, messageIds || []);
-  if (channelId) await banUser(env, channelId, userId);
-  await env.DB.prepare("DELETE FROM verified_users WHERE user_id = ?").bind(userId).run();
+/**
+ * 封禁 + 删除该用户的消息。
+ * 顺序:先封禁(即使后续删除失败也不会漏封),再删消息。
+ * 删不完 / 封禁未确认时保留记录,交给下一轮 cron 继续 —— 不会静默丢数据。
+ */
+async function failAndBan(env, { userId, channelId, chatId, messageIds }, budget) {
+  let banned = true;
+  if (channelId) {
+    if (budget.take()) {
+      const res = await telegram(env, "banChatMember", {
+        chat_id: channelId,
+        user_id: Number(userId),
+        revoke_messages: true,
+      });
+      banned = res?.ok === true;
+      if (!banned) console.log(`[ban] 封禁未确认 user=${userId} channel=${channelId}`);
+    } else {
+      banned = false;
+    }
+  }
+
+  const remaining = await deleteMessages(env, chatId, messageIds || [], budget);
+
+  if (banned && remaining.length === 0) {
+    await env.DB.prepare("DELETE FROM verified_users WHERE user_id = ?").bind(userId).run();
+    return true;
+  }
+
+  // 没做完:留下记录和未删的消息 id,下一轮 sweep / 下一条消息继续处理
+  await env.DB.prepare("UPDATE verified_users SET seen_message_ids = ? WHERE user_id = ?")
+    .bind(remaining.join(","), userId)
+    .run();
+  console.log(
+    `[failAndBan] 未完成 user=${userId} banned=${banned} remaining=${remaining.length}`
+  );
+  return false;
 }
 
 async function handleUpdate(update, env) {
@@ -207,6 +289,10 @@ async function handleUpdate(update, env) {
   const topic = message?.direct_messages_topic;
   if (!message || !topic?.topic_id) return;
 
+  // 先判白名单再花钱:未配置时零成本丢弃
+  const wl = getWhitelist(env);
+  if (wl.mode === "none") return;
+
   const userId = String(topic.user?.id ?? message.from?.id ?? "");
   if (!userId) return;
 
@@ -214,21 +300,15 @@ async function handleUpdate(update, env) {
   const chatId = String(message.chat?.id ?? "");
   const messageId = message.message_id != null ? String(message.message_id) : "";
 
-  const [channelId, row] = await Promise.all([
-    resolveChannelId(message, env),
-    (async () => {
-      await ensureSchema(env);
-      return env.DB.prepare(
-        "SELECT status, pending_at, challenge_message_id, seen_message_ids FROM verified_users WHERE user_id = ?"
-      )
-        .bind(userId)
-        .first();
-    })(),
-  ]);
-
-  const wl = getWhitelist(env);
-  if (wl.mode === "none") return;
+  const channelId = await resolveChannelId(message, env);
   if (wl.mode === "list" && (!channelId || !wl.ids.includes(channelId))) return;
+
+  await ensureSchema(env);
+  const row = await env.DB.prepare(
+    "SELECT status, pending_at, challenge_message_id, seen_message_ids FROM verified_users WHERE user_id = ?"
+  )
+    .bind(userId)
+    .first();
 
   const text = typeof message.text === "string" ? message.text.trim() : "";
   const passPhrase = getPassPhrase(env);
@@ -245,7 +325,7 @@ async function handleUpdate(update, env) {
       const reacted = await reactToMessage(env, chatId, messageId);
       if (!reacted) console.log(`[react] 点表情失败 messageId=${messageId}`);
 
-      await deleteMessages(env, chatId, [row.challenge_message_id]);
+      await deleteMessages(env, chatId, [row.challenge_message_id], makeBudget(2));
       await env.DB.prepare(
         `UPDATE verified_users
             SET status = 'verified', pending_at = NULL,
@@ -267,12 +347,16 @@ async function handleUpdate(update, env) {
 
     if (!expired) return;
 
-    await failAndBan(env, {
-      userId,
-      channelId,
-      chatId,
-      messageIds: [row.challenge_message_id, ...splitMessageIds(seen)],
-    });
+    await failAndBan(
+      env,
+      {
+        userId,
+        channelId,
+        chatId,
+        messageIds: [row.challenge_message_id, ...splitMessageIds(seen)],
+      },
+      makeBudget()
+    );
     return;
   }
 
@@ -280,7 +364,7 @@ async function handleUpdate(update, env) {
     env,
     chatId,
     topicId,
-    `⭕正在进行人机验证，请在 ${humanizeSeconds(windowSec)}内,把下面这句话原样发给我，否则将会被永久封禁:\n\n` +
+    `⭕ 正在进行人机验证，请在 ${humanizeSeconds(windowSec)}内，把下面这句话原样发给我，否则将会被永久封禁：\n\n` +
       `<code>${escapeHtml(passPhrase)}</code>`,
     {
       parse_mode: "HTML",
@@ -318,33 +402,44 @@ async function sweepExpired(env) {
   await ensureSchema(env);
 
   const cutoff = nowSec() - getWindowSeconds(env);
+  // ORDER BY:先处理最早过期的,避免旧记录被新记录挤掉永远轮不到
   const rows = await env.DB.prepare(
     `SELECT user_id, channel_id, chat_id, challenge_message_id, seen_message_ids
        FROM verified_users
       WHERE status = 'pending' AND pending_at IS NOT NULL AND pending_at <= ?
+      ORDER BY pending_at ASC
       LIMIT ${SWEEP_LIMIT}`
   )
     .bind(cutoff)
     .all();
 
+  const budget = makeBudget();
   for (const r of rows.results || []) {
-    await failAndBan(env, {
-      userId: String(r.user_id),
-      channelId: String(r.channel_id || ""),
-      chatId: String(r.chat_id || ""),
-      messageIds: [r.challenge_message_id, ...splitMessageIds(r.seen_message_ids)],
-    });
+    if (budget.left <= 0) break;
+    await failAndBan(
+      env,
+      {
+        userId: String(r.user_id),
+        channelId: String(r.channel_id || ""),
+        chatId: String(r.chat_id || ""),
+        messageIds: [r.challenge_message_id, ...splitMessageIds(r.seen_message_ids)],
+      },
+      budget
+    );
   }
 }
 
 export default {
   async fetch(request, env) {
-    if (request.method !== "POST") return ok();
+    if (request.method !== "POST") return versionResponse(request);
 
-    if (env.WEBHOOK_SECRET) {
-      const token = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-      if (token !== env.WEBHOOK_SECRET) return new Response("forbidden", { status: 403 });
+    const secret = String(env.WEBHOOK_SECRET ?? "").trim();
+    if (!secret) {
+      console.log("[config] WEBHOOK_SECRET 未配置，拒绝处理请求(fail closed)");
+      return new Response("webhook secret not configured", { status: 500 });
     }
+    const token = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+    if (token !== secret) return new Response("forbidden", { status: 403 });
 
     let update;
     try {
@@ -356,7 +451,8 @@ export default {
     try {
       await handleUpdate(update, env);
     } catch (err) {
-      console.log("[handleUpdate] 出错: " + (err?.stack || err?.message || String(err)));
+      const msg = handleDbError(err);
+      console.log("[handleUpdate] 出错: " + msg);
     }
 
     return ok();
@@ -366,7 +462,8 @@ export default {
     try {
       await sweepExpired(env);
     } catch (err) {
-      console.log("[sweepExpired] 出错: " + (err?.stack || err?.message || String(err)));
+      const msg = handleDbError(err);
+      console.log("[sweepExpired] 出错: " + msg);
     }
   },
 };
