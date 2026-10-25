@@ -1,0 +1,20 @@
+name = "tg-channel-verify"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# D1 绑定：database_id 换成你自己的（wrangler d1 create tg-channel-verify 会打印）
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-channel-verify"
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
+
+# 每分钟扫一次超时未验证的用户
+[triggers]
+crons = ["* * * * *"]
+
+# 非机密的普通变量放这里；BOT_TOKEN / WEBHOOK_SECRET 用 secret 存：
+#   wrangler secret put BOT_TOKEN
+#   wrangler secret put WEBHOOK_SECRET
+[vars]
+CHANNEL_IDS = ""

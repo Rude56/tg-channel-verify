@@ -2,6 +2,10 @@
 
 > Cloudflare Workers + D1 + Cron · 零依赖 · 免费部署
 
+当前版本 **v1.1.0** · 访问 Worker 根地址可直接查看版本号：
+`https://<你的 Worker 域名>/` → `tg-channel-verify v1.1.0`
+（请求头带 `Accept: application/json` 时返回 `{"name":"tg-channel-verify","version":"1.1.0"}`）
+
 一个给 Telegram **频道私信(Channel Direct Messages)** 做人机验证的机器人。
 
 用户第一次给频道发私信时,Bot 会要求他在规定时间内**原样回复一句指定的话**:
@@ -35,14 +39,29 @@
 | ----------------------- | ------------------------------- | ---------------------- | ------------------------------------------------------------ |
 | `BOT_TOKEN`             | ✅ **必须**                      | `12345:AAH...`                      | @BotFather 给的 Bot Token                                    |
 | `CHANNEL_IDS`           | ✅ **必须填**,否则不处理任何消息 | `-100123456789`                     | 允许的**频道 ID**，多个用`,`分隔。`*` = 全部允许 |
-| `WEBHOOK_SECRET`        | ⚠️ 强烈建议                      | `abc-ABC_123`                      | 自定义字符串，用于校验 Telegram 请求。只能使用`a-z` `A-Z` `0-9` `-` `_`（1~256位） |
+| `WEBHOOK_SECRET`        | ✅ **必须**                      | `abc-ABC_123`                      | 自定义字符串，用于校验 Telegram 请求。**未配置时 Worker 会拒绝处理所有请求**（fail closed）。只能使用`a-z` `A-Z` `0-9` `-` `_`（1~256位） |
 | `PASS_PHRASE`           | ⬜ 可选                          | `我是真人，我不打广告` | 验证语,用户需原样回复                                        |
 | `VERIFY_WINDOW_SECONDS` | ⬜ 可选                          | `600`                  | 超时秒数(默认 10 分钟)                                       |
 
-**最小可运行配置**:`BOT_TOKEN` + `CHANNEL_IDS` + 数据库绑定 **`DB`**。
+**最小可运行配置**:`BOT_TOKEN` + `CHANNEL_IDS` + `WEBHOOK_SECRET` + 数据库绑定 **`DB`**。
 其余变量都可以不填,代码里有默认值。
 
 ## 部署
+
+### 方式 A：wrangler（推荐，可用 git 管理）
+
+```bash
+npm install
+npx wrangler login
+npx wrangler d1 create tg-channel-verify        # 把打印出的 database_id 填进 wrangler.toml
+npx wrangler secret put BOT_TOKEN
+npx wrangler secret put WEBHOOK_SECRET
+npx wrangler deploy
+```
+
+`CHANNEL_IDS` 等普通变量写在 `wrangler.toml` 的 `[vars]` 里，改完重新 `wrangler deploy` 即可。
+
+### 方式 B：网页控制台（不装任何东西）
 
 1. **建 D1**:Cloudflare → Storage & Databases → D1 → 创建数据库
 2. **建 Worker**:Workers & Pages → Create Worker → 把 [worker.js](https://github.com/Rude56/tg-channel-verify/blob/main/worker.js) 全部粘贴进编辑器 → Deploy
@@ -118,6 +137,21 @@ CREATE INDEX IF NOT EXISTS idx_vu_pending
 - 判定的是「Bot 首次见到该用户」,不是 Telegram 历史首条。
 - 验证语用 HTML `<code>` 渲染成等宽,方便用户长按复制。
 - 建议**不要公开 Bot 的用户名** —— 用户私信的是频道,不需要知道 Bot 是谁;公开了只会招来私聊消耗额度。
+
+## 更新日志
+
+### v1.1.0
+
+- **`WEBHOOK_SECRET` 改为必填**：未配置时 Worker 返回 500 并记录日志，不再敞开接收任意 POST。升级后请务必在设置里补上，然后重新 setWebhook。
+- **新增版本号**：`GET /` 返回 `tg-channel-verify v<版本>`，带 `Accept: application/json` 时返回 JSON。
+- **删除消息受配额约束**：Cloudflare 免费版单次调用子请求上限 50，原先一次性串行删除全部消息会撞上限并静默失败。现在单轮最多 40 次调用，删不完的部分保留在数据库里，交给下一轮 cron 继续。
+- **失败处理顺序调整**：先封禁再删消息；封禁未确认或消息没删完时**不再删除数据库记录**，避免"人没封上、记录也没了"的不一致状态。
+- **sweep 增加 `ORDER BY pending_at ASC`**：按过期时间先后处理，旧记录不会被新记录挤掉。
+- **表被外部 DROP 后自动重建**：命中 `no such table` 时重置内部 schema 标志，不必等 isolate 重启（改表结构仍建议 Redeploy）。
+- **白名单判空提前**：`CHANNEL_IDS` 未配置时在调用 `getChat` 和查询数据库之前就返回，真正做到入口丢弃。
+- **频道 ID 缓存加上限**（500 条，FIFO 淘汰），避免 isolate 内无限增长。
+- **文案标点修正**：验证提示改用全角标点。
+- 新增 `wrangler.toml`、`package.json`、`test/` 单元测试（`npm test`，10 个用例覆盖版本号、鉴权、验证流程、超时封禁、配额截断）。
 
 ## 开源协议
 
